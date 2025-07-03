@@ -8,6 +8,9 @@ const { uuid } = require("uuidv4");
 const { hmacValidator } = require('@adyen/api-library');
 const { Client, Config, CheckoutAPI } = require("@adyen/api-library");
 
+// In-memory store for authorised payments
+const authorisedPayments = new Map();
+
 // init app
 const app = express();
 // setup request logging
@@ -56,23 +59,70 @@ app.post("/api/sessions", async (req, res) => {
     // const isHttps = req.connection.encrypted;
     const protocol = req.socket.encrypted? 'https' : 'http';
     // Ideally the data passed here should be computed based on business logic
+    const amount = { currency: "EUR", value: 10000 }; // value is 100€ in minor units
+
     const response = await checkout.PaymentsApi.sessions({
-      amount: { currency: "EUR", value: 10000 }, // value is 100€ in minor units
+      amount,
       countryCode: "NL",
       merchantAccount: process.env.ADYEN_MERCHANT_ACCOUNT, // required
       reference: orderRef, // required: your Payment Reference
       returnUrl: `${protocol}://${localhost}/handleShopperRedirect?orderRef=${orderRef}`, // set redirect URL required for some payment methods (ie iDEAL)
+      // delay capture to allow auth & capture flow
+      additionalData: { authorisationType: "PreAuth" },
       // set lineItems required for some payment methods (ie Klarna)
       lineItems: [
-        {quantity: 1, amountIncludingTax: 5000 , description: "Sunglasses"},
-        {quantity: 1, amountIncludingTax: 5000 , description: "Headphones"}
-      ] 
+        { quantity: 1, amountIncludingTax: 5000, description: "Sunglasses" },
+        { quantity: 1, amountIncludingTax: 5000, description: "Headphones" }
+      ]
     });
+
+    // store the amount for later capture
+    authorisedPayments.set(orderRef, { amount: amount.value, currency: amount.currency });
 
     res.json(response);
   } catch (err) {
     console.error(`Error: ${err.message}, error code: ${err.errorCode}`);
     res.status(err.statusCode).json(err.message);
+  }
+});
+
+// Capture authorised payment within 7 days
+app.post("/api/capture", async (req, res) => {
+  const { orderRef } = req.body;
+
+  if (!authorisedPayments.has(orderRef)) {
+    console.error(`Capture failed: unknown orderRef ${orderRef}`);
+    return res.status(404).json({ message: "Payment not found" });
+  }
+
+  const payment = authorisedPayments.get(orderRef);
+
+  if (!payment.pspReference) {
+    console.error(`Capture failed: payment ${orderRef} not authorised yet`);
+    return res.status(400).json({ message: "Payment not authorised" });
+  }
+
+  // check capture is within 7 days from authorisation
+  const diffMs = Date.now() - payment.authorisedAt.getTime();
+  if (diffMs > 7 * 24 * 60 * 60 * 1000) {
+    console.error(`Capture failed: authorisation for ${orderRef} expired`);
+    return res.status(400).json({ message: "Capture period expired" });
+  }
+
+  try {
+    const response = await checkout.ModificationsApi.captureAuthorisedPayment(
+      payment.pspReference,
+      {
+        merchantAccount: process.env.ADYEN_MERCHANT_ACCOUNT,
+        amount: { currency: payment.currency, value: payment.amount },
+        reference: orderRef,
+      }
+    );
+    console.log(`Capture successful for ${orderRef}`);
+    res.json(response);
+  } catch (err) {
+    console.error(`Capture API error for ${orderRef}: ${err.message}`);
+    res.status(err.statusCode || 500).json({ message: err.message });
   }
 });
 
@@ -145,9 +195,16 @@ app.all("/handleShopperRedirect", async (req, res) => {
   } else if (redirect.payload) {
     details.payload = redirect.payload;
   }
+  const orderRef = redirect.orderRef || req.query.orderRef;
 
   try {
     const response = await checkout.PaymentsApi.paymentsDetails({ details });
+    if (response.pspReference && authorisedPayments.has(orderRef)) {
+      const stored = authorisedPayments.get(orderRef);
+      stored.pspReference = response.pspReference;
+      stored.authorisedAt = new Date();
+      authorisedPayments.set(orderRef, stored);
+    }
     // Conditionally handle different result codes for the shopper
     switch (response.resultCode) {
       case "Authorised":
